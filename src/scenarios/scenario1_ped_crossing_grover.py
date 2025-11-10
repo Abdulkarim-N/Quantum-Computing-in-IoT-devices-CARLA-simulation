@@ -6,12 +6,23 @@ from pathlib import Path
 
 from src.planning.config import PlanConfig
 from src.planning.prediction import ped_predictor, is_ped_relevant
-from src.planning.selector import choose_accel_for_tick
 
 from src.common.geometry import fwd_vec, right_vec, move_behind, transform_on_other_side
 from src.common.world import build_lane_polyline, follow_spectator
 from src.common.control import accel_to_controls
 from src.common.snapshot import save_snapshot
+
+from qiskit import QuantumCircuit, transpile
+from qiskit_aer import Aer
+
+from src.planning.candidates import make_accel_profiles
+from src.planning.evaluator import eval_candidate
+from src.quantum.grover_ped_demo import (
+    grover_oracle_from_costs,
+    grover_diffusion,
+    ACTION_TO_BIT,
+    BIT_TO_ACTION,
+)
 
 # ------- Scenario Parameters -------
 TOWN = "Town03"          # urban map
@@ -101,12 +112,6 @@ def main():
         ticks_to_delay = int(CROSS_DELAY_S / SIM_DT)
         ticks_total = int(RUNTIME_S / SIM_DT)
         print("[Scenario] Starting. Pedestrian crosses after delay.")
-
-        # --- snapshot setup (once) ---
-        snapshot_written = False
-        snapshot_path = Path("snapshots/ped_scenario_tick.json")
-        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-
         # ---------------------------------------------------
         #  Simulation loop
         # ---------------------------------------------------
@@ -117,67 +122,58 @@ def main():
 
             # Replan at lower frequency
             if tick % PLAN_EVERY == 0:
-                snap_path = f"snapshots/ped_scenario_t{sim_time:.2f}.json"
-                save_snapshot(world, ego, ped, cfg, sim_time, snap_path)
-
                 lane_points, s0, v0 = build_lane_polyline(
                     world, ego, max_m=200.0, ds=1.0
                 )
-
                 if is_ped_relevant(ego, ped.get_location(), max_range=60.0):
-                    name, cost, a0, diag = choose_accel_for_tick(
-                        v0, s0, lane_points, ped_pred, cfg,
-                        t_world=sim_time, ego_half_width=ego_half_width
-                    )
+                    # --- Generate candidate profiles ---
+                    all_profiles = make_accel_profiles(v0, cfg)
+                    profiles = {n: p for n, p in all_profiles.items() if n in ACTION_TO_BIT}
 
-                    # --- snapshot once when it's interesting ---
-                    if (not snapshot_written) and diag and diag.get("clearance_min", 99) < 8.0:
-                        ego_loc = ego.get_location()
-                        ego_vel = ego.get_velocity()
-                        ped_loc_now = ped.get_location()
-                        ped_vel_now = ped.get_velocity()
+                    per_action = {}
+                    for pname, prof in profiles.items():
+                        valid, cst, d = eval_candidate(
+                            prof, v0, s0, lane_points, ped_pred, cfg,
+                            t_world=sim_time, ego_half_width=ego_half_width,
+                        )
+                        if valid:
+                            per_action[pname] = cst
 
-                        snap = {
-                            "sim_time": sim_time,
-                            "ego": {
-                                "loc": [ego_loc.x, ego_loc.y, ego_loc.z],
-                                "vel": [ego_vel.x, ego_vel.y, ego_vel.z],
-                                "half_width": ego_half_width,
-                            },
-                            "ped": {
-                                "loc": [ped_loc_now.x, ped_loc_now.y, ped_loc_now.z],
-                                "vel": [ped_vel_now.x, ped_vel_now.y, ped_vel_now.z],
-                            },
-                            "cfg": {
-                                "dt": cfg.dt,
-                                "horizon_s": cfg.horizon_s,
-                                "v_ref": cfg.v_ref,
-                                "d_safe": cfg.d_safe,
-                            },
-                            "meta": {
-                                "tick": tick,
-                                "plan_every": PLAN_EVERY,
-                                "town": TOWN,
-                            },
-                        }
-                        snapshot_path.write_text(json.dumps(snap, indent=2))
-                        snapshot_written = True
+                    if not per_action:
+                        print(f"[Grover@{sim_time:.2f}s] No valid profiles, keeping previous accel.")
+                        a0 = 0.0
+                    else:
+                        # --- Run Grover search ---
+                        qc = QuantumCircuit(2, 2)
+                        qc.h([0, 1])
+                        oracle = grover_oracle_from_costs(per_action)
+                        diffusion = grover_diffusion(2)
+                        qc.compose(oracle, [0, 1], inplace=True)
+                        qc.compose(diffusion, [0, 1], inplace=True)
+                        qc.measure([0, 1], [0, 1])
 
-                    # Failsafe brake if too close
-                    if diag:
-                        dmin = diag.get("clearance_min", 99)
-                        if dmin < cfg.d_safe + 1.5:
-                            # pedestrian still close → creep instead of accelerating
-                            a0 = -0.5      # gentle hold
-                            name = "creep"
+                        backend = Aer.get_backend("aer_simulator")
+                        result = backend.run(transpile(qc, backend), shots=128).result()
+                        counts = result.get_counts()
+
+                        best_bits = max(counts, key=counts.get)
+                        best_action = BIT_TO_ACTION[best_bits]
+
+                        print(f"[Grover@{sim_time:.2f}s] Action={best_action} ({counts})")
+
+                        # --- Translate chosen action to acceleration ---
+                        if best_action == "keep":
+                            a0 = 0.0
+                        elif best_action == "comfort_brake":
+                            a0 = -2.0
+                        elif best_action == "hard_brake":
+                            a0 = -4.0
+                        elif best_action == "creep":
+                            a0 = -1.0
+                        else:
+                            a0 = 0.0
 
                     target_thr, target_brk = accel_to_controls(a0, v0, cfg.v_ref)
-
-                    print(f"[Plan] tick={tick:05d} action={name} cost={cost:.2f} "
-                          f"dmin={diag.get('clearance_min', 0):.2f}")
-                else:
-                    target_thr = 1.0 if v0 < cfg.v_ref else 0.0
-                    target_brk = 0.2 if v0 > cfg.v_ref + 0.5 else 0.0
 
             # Smooth control transitions every tick
             def lerp(a, b, t): return a + t * (b - a)
