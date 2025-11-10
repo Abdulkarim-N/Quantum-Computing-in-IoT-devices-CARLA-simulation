@@ -12,6 +12,7 @@ from src.common.geometry import fwd_vec, right_vec, move_behind, transform_on_ot
 from src.common.world import build_lane_polyline, follow_spectator
 from src.common.control import accel_to_controls
 from src.common.debug import label
+from src.common.snapshot import save_snapshot
 
 # ------- Scenario Parameters -------
 TOWN = "Town03"          # urban map
@@ -21,7 +22,7 @@ PED_SPEED_MS = 6       # walking speed
 AHEAD_M = 43.0           # ped spawn ahead of ego
 LATERAL_M = 10.0         # to the right (curb)
 SIM_DT = 0.01            # simulation time step
-RUNTIME_S = 13.0         # total scenario time
+RUNTIME_S = 10.0         # total scenario time
 PLANNING_DT = 0.10       # think at 10 Hz
 PLAN_EVERY = max(1, int(PLANNING_DT / SIM_DT))
 SMOOTH_ALPHA = 0.4       # how fast we ease controls toward targets
@@ -123,6 +124,9 @@ def main():
 
             # Replan at lower frequency
             if tick % PLAN_EVERY == 0:
+                snap_path = f"snapshots/ped_scenario_t{sim_time:.2f}.json"
+                save_snapshot(world, ego, ped, cfg, sim_time, snap_path)
+
                 lane_points, s0, v0 = build_lane_polyline(
                     world, ego, max_m=200.0, ds=1.0
                 )

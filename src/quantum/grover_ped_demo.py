@@ -1,20 +1,20 @@
-# src/quantum/grover_ped_demo.py
-
+# src/quantum/grover_ped_demo_all.py
 import json
 import math
 from pathlib import Path
+import time
+import re
 
 from qiskit import QuantumCircuit, transpile
 from qiskit_aer import Aer
-from qiskit.quantum_info import Statevector
 
 from src.planning.config import PlanConfig
 from src.planning.candidates import make_accel_profiles
 from src.planning.evaluator import eval_candidate
 
-SNAP_PATH = Path("snapshots/ped_scenario_tick.json")
-
-# --- Bitstring ↔ Action mapping -------------------------------------------
+# --- constants --------------------------------------------------------------
+SNAP_DIR = Path("snapshots")
+SNAP_PATTERN = re.compile(r"ped_scenario_t([0-9.]+)\.json")
 
 BIT_TO_ACTION = {
     "00": "keep",
@@ -25,107 +25,58 @@ BIT_TO_ACTION = {
 ACTION_TO_BIT = {v: k for k, v in BIT_TO_ACTION.items()}
 
 
-# --- Lane builder (for snapshot replay) -----------------------------------
-
+# --- helpers ----------------------------------------------------------------
 def fake_lane_from_snapshot(ego_loc, ego_vel, N_pts=400, ds=1.0):
-    """Build a straight polyline in the direction of ego velocity."""
     v0 = math.hypot(ego_vel[0], ego_vel[1])
     heading = math.atan2(ego_vel[1], ego_vel[0]) if v0 > 0.1 else 0.0
     ux, uy = math.cos(heading), math.sin(heading)
 
     class P:
         __slots__ = ("x", "y", "z")
-
         def __init__(self, x, y, z):
             self.x, self.y, self.z = x, y, z
 
-    pts = [
-        P(
-            ego_loc[0] + ux * i * ds,
-            ego_loc[1] + uy * i * ds,
-            ego_loc[2],
-        )
-        for i in range(N_pts)
-    ]
+    pts = [P(ego_loc[0] + ux * i * ds, ego_loc[1] + uy * i * ds, ego_loc[2])
+           for i in range(N_pts)]
     return pts, v0
 
 
-# --- Quantum components ---------------------------------------------------
-
-def grover_oracle_for_target(target_bits: str) -> QuantumCircuit:
-    """
-    Mark |target_bits> by phase inversion.
-
-    Conventions:
-      - target_bits is a string like '01', interpreted as |q1 q0>.
-      - Qiskit qubit 0 is the LSB (rightmost bit), qubit 1 is MSB.
-      - Statevector basis index i is formatted by format(i, "02b") -> 'q1q0'.
-    """
-    if len(target_bits) != 2:
-        raise ValueError("target_bits must be a 2-bit string, e.g. '01'.")
-
+def grover_oracle_from_costs(costs: dict[str, float]) -> QuantumCircuit:
     qc = QuantumCircuit(2)
+    # find strictly best action
+    best_action = min(costs, key=costs.get)
+    # find its bitstring
+    best_bits = ACTION_TO_BIT[best_action]
 
-    # Map bitstring 'b1b0' -> qubit1=b1, qubit0=b0
-    bit_q1, bit_q0 = target_bits[0], target_bits[1]
-
-    # X where target bit is 0 (to turn |target> into |11>)
-    if bit_q0 == "0":
-        qc.x(0)  # qubit 0 (LSB)
-    if bit_q1 == "0":
-        qc.x(1)  # qubit 1 (MSB)
-
-    # Phase flip |11> via CZ
+    # mark that single state
+    for q, b in enumerate(best_bits[::-1]):  # q0, q1
+        if b == "0":
+            qc.x(q)
     qc.cz(0, 1)
-
-    # Uncompute the Xs
-    if bit_q0 == "0":
-        qc.x(0)
-    if bit_q1 == "0":
-        qc.x(1)
+    for q, b in enumerate(best_bits[::-1]):
+        if b == "0":
+            qc.x(q)
 
     return qc
 
 
-def grover_diffusion(n_qubits: int = 2) -> QuantumCircuit:
-    """
-    Grover diffusion operator for n_qubits (reflection about |s>).
-
-    This is the standard construction:
-        H^n X^n (multi-controlled Z) X^n H^n
-
-    For n_qubits = 2, the multi-controlled Z reduces to a CZ between qubit 0 and 1.
-    """
+def grover_diffusion(n_qubits=2) -> QuantumCircuit:
     qc = QuantumCircuit(n_qubits)
-
-    # |s> -> |00..0>
     qc.h(range(n_qubits))
     qc.x(range(n_qubits))
-
-    # Multi-controlled Z about |11..1>
-    # Implemented as H-Z-H on the last qubit, controlled by all others.
     qc.h(n_qubits - 1)
     qc.mcx(list(range(n_qubits - 1)), n_qubits - 1)
     qc.h(n_qubits - 1)
-
-    # |00..0> -> |s>
     qc.x(range(n_qubits))
     qc.h(range(n_qubits))
-
     return qc
 
-# --- Main driver ----------------------------------------------------------
 
-def main():
-    snap = json.loads(SNAP_PATH.read_text())
+# --- main loop --------------------------------------------------------------
+def process_snapshot(path: Path):
+    snap = json.loads(path.read_text())
 
-    cfg = PlanConfig(
-        dt=snap["cfg"]["dt"],
-        horizon_s=snap["cfg"]["horizon_s"],
-        v_ref=snap["cfg"]["v_ref"],
-        d_safe=snap["cfg"]["d_safe"],
-    )
-
+    cfg = PlanConfig(**snap["cfg"])
     ego_loc = snap["ego"]["loc"]
     ego_vel = snap["ego"]["vel"]
     ped_loc = snap["ped"]["loc"]
@@ -136,29 +87,21 @@ def main():
     lane_points, v0 = fake_lane_from_snapshot(ego_loc, ego_vel)
     s0 = 0.0
 
-    # Simple constant-velocity pedestrian predictor
     def ped_pred(t):
         dt = max(0.0, t - t_world)
-
         class P:
             __slots__ = ("x", "y", "z")
-
             def __init__(self, x, y, z):
                 self.x, self.y, self.z = x, y, z
+        return P(ped_loc[0] + ped_vel[0] * dt,
+                 ped_loc[1] + ped_vel[1] * dt,
+                 ped_loc[2])
 
-        return P(
-            ped_loc[0] + ped_vel[0] * dt,
-            ped_loc[1] + ped_vel[1] * dt,
-            ped_loc[2],
-        )
-
-    # --- Classical evaluation --------------------------------------------
+    # --- Classical evaluation
     all_profiles = make_accel_profiles(v0, cfg)
     profiles = {n: p for n, p in all_profiles.items() if n in ACTION_TO_BIT}
 
-    print(f"\n[Offline] Testing {len(profiles)} profiles "
-          f"at snapshot t={t_world:.2f}s")
-
+    per_action = {}
     best_name, best_cost, best_diag = None, float("inf"), None
 
     for name, prof in profiles.items():
@@ -166,64 +109,79 @@ def main():
             prof, v0, s0, lane_points, ped_pred,
             cfg, t_world=t_world, ego_half_width=ego_half_width,
         )
-        print(
-            f"  - {name:14s} valid={valid} cost={cost:.2f} "
-            f"dmin={diag.get('clearance_min', 0):.2f}"
-        )
+        per_action[name] = (valid, cost, diag)
         if valid and cost < best_cost:
             best_name, best_cost, best_diag = name, cost, diag
 
-    print(
-        f"\n[Offline] Best classical profile: {best_name} "
-        f"cost={best_cost:.2f} "
-        f"dmin={best_diag.get('clearance_min', 0):.2f}"
-    )
+    costs = {name: cost for name, (valid, cost, _) in per_action.items() if valid}
 
-    # --- Quantum Grover search demo --------------------------------------
-    target_bits = ACTION_TO_BIT[best_name]
-    print(f"\n[Grover] Target action '{best_name}' encoded as |{target_bits}>")
+    if not costs:
+        print(f"  [Warning] No valid candidate profiles at t={t_world:.2f}s — skipping.")
+        return {
+            "time": t_world,
+            "classical_best": best_name,
+            "grover_best": None,
+            "counts": {},
+            "costs": {},
+        }
 
+    # --- Quantum run
     qc = QuantumCircuit(2, 2)
-
-    # 1) Initialize in uniform superposition
     qc.h([0, 1])
-
-    # 2–3) Grover iterations
-    oracle = grover_oracle_for_target(target_bits)
+    oracle = grover_oracle_from_costs(costs)
     diffusion = grover_diffusion(2)
-
-    num_iters = 1  # Optimal for 4 items
-
-    for _ in range(num_iters):
-        qc.compose(oracle, [0, 1], inplace=True)
-        qc.compose(diffusion, [0, 1], inplace=True)
-
-    # 4) Statevector diagnostics (no measurement)
-    qc_no_meas = qc.remove_final_measurements(inplace=False)
-    sv = Statevector.from_instruction(qc_no_meas)
-    print(f"\n[Grover] Statevector amplitudes after {num_iters} iterations:")
-    for i, amp in enumerate(sv.data):
-        bits = format(i, "02b")  # |q1 q0>
-        print(f"  |{bits}>  amp={amp.real:+.3f}{amp.imag:+.3f}j")
-
-    # 5) Measurement simulation
+    qc.compose(oracle, [0, 1], inplace=True)
+    qc.compose(diffusion, [0, 1], inplace=True)
     qc.measure([0, 1], [0, 1])
-    backend = Aer.get_backend("aer_simulator")
-    qc = transpile(qc, backend)
-    result = backend.run(qc, shots=512).result()
-    counts = result.get_counts()
 
-    print("\n[Grover] Measurement counts:")
-    for bits, c in sorted(counts.items()):
-        action = BIT_TO_ACTION.get(bits, "?")
-        print(f"  |{bits}> ({action:14s}) -> {c} shots")
+    backend = Aer.get_backend("aer_simulator")
+    result = backend.run(transpile(qc, backend), shots=512).result()
+    counts = result.get_counts()
 
     best_bits = max(counts, key=counts.get)
     best_action = BIT_TO_ACTION[best_bits]
-    print(
-        f"\n[Grover] Most likely outcome: |{best_bits}> "
-        f"→ action '{best_action}'"
-    )
+    return {
+        "time": t_world,
+        "classical_best": best_name,
+        "grover_best": best_action,
+        "counts": counts,
+        "costs": costs,
+    }
+
+
+def main():
+    # collect only files matching ped_scenario_t<number>.json
+    tagged = []
+    for p in SNAP_DIR.glob("*.json"):
+        m = SNAP_PATTERN.match(p.name)
+        if not m:
+            continue  # skip things like ped_scenario_tick.json
+        t = float(m.group(1))
+        tagged.append((t, p))
+
+    snap_paths = [p for t, p in sorted(tagged, key=lambda x: x[0])]
+    print(f"[Grover] Found {len(snap_paths)} snapshots in {SNAP_DIR}")
+
+    if not snap_paths:
+        print("[Grover] No matching ped_scenario_t*.json files found.")
+        return
+
+    results = []
+    for p in snap_paths:
+        print(f"\n=== Processing {p.name} ===")
+        t0 = time.perf_counter()
+        res = process_snapshot(p)
+        t1 = time.perf_counter()
+        results.append(res)
+
+        print(f"  Classical best: {res['classical_best']}")
+        print(f"  Grover best:    {res['grover_best']}")
+        print(f"  Duration:       {t1 - t0:.3f}s")
+
+    print("\n=== Summary ===")
+    matches = sum(r["classical_best"] == r["grover_best"] for r in results)
+    print(f"Grover agreed with classical planner {matches}/{len(results)} times.")
+
 
 
 if __name__ == "__main__":
