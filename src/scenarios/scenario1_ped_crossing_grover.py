@@ -33,7 +33,7 @@ AHEAD_M = 43.0           # keep this (avoids object collision)
 LATERAL_M = 8.0          # pedestrian crossing offset
 SIM_DT = 0.01            # simulation time step
 RUNTIME_S = 12.0         # total scenario duration
-PLANNING_DT = 0.10       # plan at 10 Hz
+PLANNING_DT = 0.20       # plan at 5 Hz
 PLAN_EVERY = max(1, int(PLANNING_DT / SIM_DT))
 SMOOTH_ALPHA = 0.4       # smooth control transitions
 # -----------------------------------

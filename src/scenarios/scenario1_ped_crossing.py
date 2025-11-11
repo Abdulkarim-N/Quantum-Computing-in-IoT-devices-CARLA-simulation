@@ -22,7 +22,7 @@ AHEAD_M = 43.0           # keep this (avoids object collision)
 LATERAL_M = 8.0          # pedestrian crossing offset
 SIM_DT = 0.01            # simulation time step
 RUNTIME_S = 12.0         # total scenario duration
-PLANNING_DT = 0.10       # plan at 10 Hz
+PLANNING_DT = 0.20       # plan at 5 Hz
 PLAN_EVERY = max(1, int(PLANNING_DT / SIM_DT))
 SMOOTH_ALPHA = 0.4       # smooth control transitions
 # -----------------------------------
@@ -93,7 +93,7 @@ def main():
         )
 
         cfg = PlanConfig(dt=PLANNING_DT, horizon_s=3.0,
-                         v_ref=EGO_SPEED_MS, d_safe=3.5)
+                         v_ref=EGO_SPEED_MS, d_safe=2)
 
         target_thr, target_brk = 0.0, 0.0
         apply_thr, apply_brk = 0.0, 0.0
@@ -162,14 +162,6 @@ def main():
                         }
                         snapshot_path.write_text(json.dumps(snap, indent=2))
                         snapshot_written = True
-
-                    # Failsafe brake if too close
-                    if diag:
-                        dmin = diag.get("clearance_min", 99)
-                        if dmin < cfg.d_safe + 1.5:
-                            # pedestrian still close → creep instead of accelerating
-                            a0 = -0.5      # gentle hold
-                            name = "creep"
 
                     target_thr, target_brk = accel_to_controls(a0, v0, cfg.v_ref)
 
