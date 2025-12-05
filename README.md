@@ -7,7 +7,7 @@
 A demo project exploring quantum algorithms for autonomous vehicle decision-making. I simulated Grover's Algorithm running on classical hardware and compared it to traditional approaches in a realistic driving scenario.
 
 **Author**: Abdulkarim-N  
-**Demo**: Vehicle Cut-In Scenario
+**Demo**: Vehicle Cut-In Scenario (Scenario two)
 
 ---
 
